@@ -109,7 +109,7 @@ end
 function optimize(obj, p0::Vector{<:Real};
         lower_bounds::Union{Vector{<:Real}, Nothing}=nothing,
         upper_bounds::Union{Vector{<:Real}, Nothing}=nothing,
-        vary::Union{BitVector, Nothing}=nothing,
+        vary::Union{Vector{Bool}, Nothing}=nothing,
         scale_factors::Union{Vector{<:Real}, Nothing}=nothing,
         options::Union{NamedTuple, NelderMeadOptions, Nothing}=nothing
     )
