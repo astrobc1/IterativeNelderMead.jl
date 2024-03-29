@@ -12,13 +12,11 @@ struct NelderMeadOptions
     ftol_abs::Float64
     xtol_rel::Float64
     xtol_abs::Float64
-    penalty::Float64
-    ditch_value::Float64
 end
 
-function NelderMeadOptions(n_vary::Int, ;max_fcalls::Int=1400 * n_vary, no_improve_break::Int=3, n_iterations::Int=n_vary, ftol_rel::Real=1E-6, ftol_abs::Real=1E-6, xtol_rel::Real=1E-6, xtol_abs::Real=1E-6, penalty::Real=1E6, ditch_value::Real=1E8)
+function NelderMeadOptions(n_vary::Int, ;max_fcalls::Int=1400 * n_vary, no_improve_break::Int=3, n_iterations::Int=n_vary, ftol_rel::Real=1E-8, ftol_abs::Real=1E-12, xtol_rel::Real=1E-8, xtol_abs::Real=1E-12)
     @assert n_vary > 0
-    return NelderMeadOptions(max_fcalls, no_improve_break, n_iterations, ftol_rel, ftol_abs, xtol_rel, xtol_abs, penalty, ditch_value)
+    return NelderMeadOptions(max_fcalls, no_improve_break, n_iterations, ftol_rel, ftol_abs, xtol_rel, xtol_abs)
 end
 
 
@@ -63,25 +61,18 @@ function initial_simplex(p0, lower_bounds, upper_bounds, vary, scale_factors)
     scale_factorsv = scale_factors[indsv]
     nv = length(p0v)
     simplex = repeat(p0v, 1, nv+1)
-    #simplex[:, 1:end-1] .+= diagm(scale_factors[indsv] .* p0v)
     simplex[:, 1:end-1] .+= diagm(scale_factors[indsv])
-    #for i=1:nv
-    #   simplex[:, i] .= scale_factorsv .* randn(nv) .+ p0v
-    #end
     for i=1:nv
         clamp!(view(simplex, i, :), lower_boundsv[i], upper_boundsv[i])
-        #if isfinite(lower_boundsv[i])
-        #    simplex[]
-        #end
-        #if isfinite(upper_boundsv[i])
-        #end
     end
     return simplex
 end
 
+
 function set_subpsace!(state::NelderMeadState, subspace::Subspace)
     state.subspace = subspace
 end
+
 
 function initialize_subspaces(vary)
     subspaces = Subspace[]
@@ -105,6 +96,7 @@ function initialize_subspaces(vary)
     end
     return full_subspace, subspaces
 end
+
 
 function optimize(obj, p0::Vector{<:Real};
         lower_bounds::Union{Vector{<:Real}, Nothing}=nothing,
@@ -169,8 +161,6 @@ function optimize(obj, p0::Vector{<:Real};
         set_subpsace!(state, state.full_space)
         state.fprev = state.fbest
         optimize_space!(state, obj, p0, lower_bounds, upper_bounds, vary, options)
-
-        break
         
         # If there's <= 2 params, a three-simplex is the smallest simplex used and only used once.
         if nv <= 2
@@ -185,16 +175,12 @@ function optimize(obj, p0::Vector{<:Real};
 
         # Check x
         x_converged = (compute_dx_rel(state.full_simplex) < options.xtol_rel) || (compute_dx_abs(state.full_simplex) < options.xtol_abs)
-        #x_converged = false
 
         # Check f
         f_converged = (compute_df_rel(state.fbest, state.fprev) < options.ftol_rel) || (compute_df_abs(state.fbest, state.fprev) < options.ftol_abs)
 
         # Check f calls
         fcalls_converged = state.fcalls >= options.max_fcalls
-
-        # Verbose
-        @show x_converged f_converged fcalls_converged
 
         # Converged?
         if x_converged || f_converged || fcalls_converged
@@ -213,9 +199,11 @@ function optimize(obj, p0::Vector{<:Real};
 
 end
 
+
 function update_state!(state::NelderMeadState, iteration::Int)
     state.iteration = iteration
 end
+
 
 function get_subspace_simplex(subspace, p0, pbest)
     n = length(subspace.indices)
@@ -229,6 +217,7 @@ function get_subspace_simplex(subspace, p0, pbest)
     end
     return simplex
 end
+
 
 function optimize_space!(state::NelderMeadState, obj, p0, lower_bounds, upper_bounds, vary, options::NelderMeadOptions)
 
@@ -259,7 +248,7 @@ function optimize_space!(state::NelderMeadState, obj, p0, lower_bounds, upper_bo
     
     # Generate the fvals for the initial simplex
     for i=1:nxp1
-        fvals[i] = @views compute_obj(obj, simplex[:, i], state, lower_bounds, upper_bounds, vary, options)
+        fvals[i] = @views compute_obj(obj, simplex[:, i], 1E8, state, lower_bounds, upper_bounds, vary, options)
     end
 
     # Sort the fvals and then simplex
@@ -281,6 +270,9 @@ function optimize_space!(state::NelderMeadState, obj, p0, lower_bounds, upper_bo
     
     # Loop
     while true
+
+        # fmax for penalizing objective when things go bad
+        fmax = maximum(abs.(fvals))
             
         # Checks whether or not to shrink if all other checks "fail"
         shrink = false
@@ -291,7 +283,7 @@ function optimize_space!(state::NelderMeadState, obj, p0, lower_bounds, upper_bo
         end
             
         # Break if f tolerance has been met no_improve_break times in a row
-        if compute_df_rel(f1, fnp1) > ftol_rel # || compute_df_abs(f1, fnp1) > ftol_abs
+        if compute_df_rel(f1, fnp1) > ftol_rel || compute_df_abs(f1, fnp1) > ftol_abs
             n_converged = 0
         else
             n_converged += 1
@@ -311,11 +303,11 @@ function optimize_space!(state::NelderMeadState, obj, p0, lower_bounds, upper_bo
         xr .= xbar .+ α .* (xbar .- xnp1)
         
         # Update the current testing parameter with xr
-        fr = compute_obj(obj, xr, state, lower_bounds, upper_bounds, vary, options)
+        fr = compute_obj(obj, xr, fmax, state, lower_bounds, upper_bounds, vary, options)
 
         if fr < f1
             xe .= xbar .+ γ .* (xbar .- xnp1)
-            fe = compute_obj(obj, xe, state, lower_bounds, upper_bounds, vary, options)
+            fe = compute_obj(obj, xe, fmax, state, lower_bounds, upper_bounds, vary, options)
             if fe < fr
                 simplex[:, end] .= xe
                 fvals[end] = fe
@@ -329,7 +321,7 @@ function optimize_space!(state::NelderMeadState, obj, p0, lower_bounds, upper_bo
         else
             if fr < fnp1
                 xc .= xbar .+ σ .* (xbar .- xnp1)
-                fc = compute_obj(obj, xc, state, lower_bounds, upper_bounds, vary, options)
+                fc = compute_obj(obj, xc, fmax, state, lower_bounds, upper_bounds, vary, options)
                 if fc <= fr
                     simplex[:, end] .= xc
                     fvals[end] = fc
@@ -338,7 +330,7 @@ function optimize_space!(state::NelderMeadState, obj, p0, lower_bounds, upper_bo
                 end
             else
                 xcc .= xbar .+ σ .* (xnp1 .- xbar)
-                fcc = compute_obj(obj, xcc, state, lower_bounds, upper_bounds, vary, options)
+                fcc = compute_obj(obj, xcc, fmax, state, lower_bounds, upper_bounds, vary, options)
                 if fcc < fvals[end]
                     simplex[:, end] .= xcc
                     fvals[end] = fcc
@@ -350,7 +342,7 @@ function optimize_space!(state::NelderMeadState, obj, p0, lower_bounds, upper_bo
         if shrink
             for j=2:nxp1
                 simplex[:, j] .= @views x1 .+ δ .* (simplex[:, j] .- x1)
-                fvals[j] = @views compute_obj(obj, simplex[:, j], state, lower_bounds, upper_bounds, vary, options)
+                fvals[j] = @views compute_obj(obj, simplex[:, j], fmax, state, lower_bounds, upper_bounds, vary, options)
             end
         end
 
@@ -425,34 +417,34 @@ end
 #### OBJECTIVE ####
 ###################
 
-function compute_obj(obj, x, state::NelderMeadState, lower_bounds, upper_bounds, vary, options::NelderMeadOptions; increase::Bool=true)
+function compute_obj(obj, x, fmax, state::NelderMeadState, lower_bounds, upper_bounds, vary, options::NelderMeadOptions; increase::Bool=true)
     if increase
         state.fcalls += 1
     end
     state.ptest[state.subspace.indices] .= x
     f = obj(state.ptest)
-    f = penalize(f, state.ptest, state.subspace, lower_bounds, upper_bounds, options)
+    f = penalize(f, fmax, state.ptest, state.subspace, lower_bounds, upper_bounds, options)
     if !isfinite(f)
-        f = options.ditch_value
+        f = 1E6 * fmax
     end
     return f
 end
 
 
-function penalize(f, ptest, subspace, lower_bounds, upper_bounds, options)
+function penalize(f, fmax, ptest, subspace, lower_bounds, upper_bounds, options)
+    penalty_factor = 100 * fmax
     for i in eachindex(subspace.indices)
         j = subspace.indices[i]
         if ptest[j] < lower_bounds[j]
-            f += options.penalty
-            f += options.penalty * (lower_bounds[j] - ptest[j])
+            f += penalty_factor * (lower_bounds[j] - ptest[j])
         end
         if ptest[j] > upper_bounds[j]
-            f += options.penalty
-            f += options.penalty * (ptest[j] - upper_bounds[j])
+            f += penalty_factor * (ptest[j] - upper_bounds[j])
         end
     end
     return f
 end
+
 
 function get_scale_factors(p0, lower_bounds, upper_bounds, vary; factor::Real=0.5)
     scale_factors = zeros(length(p0))
@@ -479,8 +471,10 @@ end
 #### OUTPUT ####
 ################
 
+
 function get_result(state::NelderMeadState)
     return (;pbest=state.pbest, fbest=state.fbest, fcalls=state.fcalls, simplex=state.full_simplex, iterations=state.iteration)
 end
+
 
 end
