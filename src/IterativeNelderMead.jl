@@ -14,7 +14,8 @@ struct NelderMeadOptions
     xtol_abs::Float64
 end
 
-function NelderMeadOptions(n_vary::Int, ;max_fcalls::Int=1400 * n_vary, no_improve_break::Int=3, n_iterations::Int=n_vary, ftol_rel::Real=1E-8, ftol_abs::Real=1E-12, xtol_rel::Real=1E-8, xtol_abs::Real=1E-12)
+
+function NelderMeadOptions(n_vary::Int, ;max_fcalls::Int=150000 * n_vary, no_improve_break::Int=3, n_iterations::Int=n_vary, ftol_rel::Real=1E-8, ftol_abs::Real=1E-12, xtol_rel::Real=1E-8, xtol_abs::Real=1E-12)
     @assert n_vary > 0
     return NelderMeadOptions(max_fcalls, no_improve_break, n_iterations, ftol_rel, ftol_abs, xtol_rel, xtol_abs)
 end
@@ -66,11 +67,6 @@ function initial_simplex(p0, lower_bounds, upper_bounds, vary, scale_factors)
         clamp!(view(simplex, i, :), lower_boundsv[i], upper_boundsv[i])
     end
     return simplex
-end
-
-
-function set_subpsace!(state::NelderMeadState, subspace::Subspace)
-    state.subspace = subspace
 end
 
 
@@ -157,8 +153,10 @@ function optimize(obj, p0::Vector{<:Real};
     # Loop over iterations
     for i=1:options.n_iterations
 
+        #Main.infiltrate(@__MODULE__, Base.@locals, @__FILE__, @__LINE__)
+
         # Perform Ameoba call for all parameters
-        set_subpsace!(state, state.full_space)
+        state.subspace = state.full_space
         state.fprev = state.fbest
         optimize_space!(state, obj, p0, lower_bounds, upper_bounds, vary, options)
         
@@ -166,10 +164,15 @@ function optimize(obj, p0::Vector{<:Real};
         if nv <= 2
             break
         end
+
+        # Converged?
+        if state.fcalls >= options.max_fcalls
+            break
+        end
         
         # Perform Ameoba call for subspaces
         for subspace ∈ state.subspaces
-            set_subpsace!(state, subspace)
+            state.subspace = subspace
             optimize_space!(state, obj, p0, lower_bounds, upper_bounds, vary, options)
         end
 
@@ -186,7 +189,7 @@ function optimize(obj, p0::Vector{<:Real};
         if x_converged || f_converged || fcalls_converged
             break
         else
-            update_state!(state, i)
+            state.iteration = i
         end
 
     end
@@ -197,11 +200,6 @@ function optimize(obj, p0::Vector{<:Real};
     # Return
     return result
 
-end
-
-
-function update_state!(state::NelderMeadState, iteration::Int)
-    state.iteration = iteration
 end
 
 
@@ -283,10 +281,10 @@ function optimize_space!(state::NelderMeadState, obj, p0, lower_bounds, upper_bo
         end
             
         # Break if f tolerance has been met no_improve_break times in a row
-        if compute_df_rel(f1, fnp1) > ftol_rel || compute_df_abs(f1, fnp1) > ftol_abs
-            n_converged = 0
-        else
+        if (compute_df_rel(f1, fnp1) < ftol_rel) || (compute_df_abs(f1, fnp1) < ftol_abs)
             n_converged += 1
+        else
+            n_converged = 0
         end
         if n_converged >= no_improve_break
             break
@@ -436,9 +434,11 @@ function penalize(f, fmax, ptest, subspace, lower_bounds, upper_bounds, options)
     for i in eachindex(subspace.indices)
         j = subspace.indices[i]
         if ptest[j] < lower_bounds[j]
+            f += penalty_factor
             f += penalty_factor * (lower_bounds[j] - ptest[j])
         end
         if ptest[j] > upper_bounds[j]
+            f += penalty_factor
             f += penalty_factor * (ptest[j] - upper_bounds[j])
         end
     end
