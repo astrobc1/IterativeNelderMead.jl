@@ -419,7 +419,6 @@ function compute_obj(obj, x, fmax, state::NelderMeadState, lower_bounds, upper_b
     if increase
         state.fcalls += 1
     end
-    state.ptest[state.subspace.indices] .= x
     f = obj(state.ptest)
     f = penalize(f, fmax, state.ptest, state.subspace, lower_bounds, upper_bounds, options)
     if !isfinite(f)
@@ -427,7 +426,6 @@ function compute_obj(obj, x, fmax, state::NelderMeadState, lower_bounds, upper_b
     end
     return f
 end
-
 
 function penalize(f, fmax, ptest, subspace, lower_bounds, upper_bounds, options)
     penalty_factor = 100 * fmax
