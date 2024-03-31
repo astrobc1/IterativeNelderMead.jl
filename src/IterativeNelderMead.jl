@@ -177,16 +177,24 @@ function optimize(obj, p0::Vector{<:Real};
         end
 
         # Check x
-        x_converged = (compute_dx_rel(state.full_simplex) < options.xtol_rel) || (compute_dx_abs(state.full_simplex) < options.xtol_abs)
+        dx_abs_converged = compute_dx_abs(state.full_simplex) < options.xtol_abs
+        dx_rel_converged = compute_dx_rel(state.full_simplex) < options.xtol_rel
 
         # Check f
-        f_converged = (compute_df_rel(state.fbest, state.fprev) < options.ftol_rel) || (compute_df_abs(state.fbest, state.fprev) < options.ftol_abs)
+        df_abs_converged = compute_df_abs(state.fbest, state.fprev) < options.ftol_abs
+        df_rel_converged = compute_df_rel(state.fbest, state.fprev) < options.ftol_rel
 
         # Check f calls
         fcalls_converged = state.fcalls >= options.max_fcalls
 
         # Converged?
-        if x_converged || f_converged || fcalls_converged
+        if dx_abs_converged || dx_rel_converged || df_abs_converged || df_rel_converged || fcalls_converged
+            # @show compute_df_abs(state.fbest, state.fprev)
+            # @show compute_df_rel(state.fbest, state.fprev)
+            # @show compute_dx_rel(state.full_simplex)
+            # @show compute_dx_abs(state.full_simplex)
+            # @show state.fcalls
+            # @show dx_abs_converged dx_rel_converged df_abs_converged df_rel_converged fcalls_converged
             break
         else
             state.iteration = i
@@ -246,7 +254,7 @@ function optimize_space!(state::NelderMeadState, obj, p0, lower_bounds, upper_bo
     
     # Generate the fvals for the initial simplex
     for i=1:nxp1
-        fvals[i] = @views compute_obj(obj, simplex[:, i], 1E8, state, lower_bounds, upper_bounds, vary, options)
+        fvals[i] = @views compute_obj(obj, simplex[:, i], 1000 * abs(state.fbest), state, lower_bounds, upper_bounds, vary, options)
     end
 
     # Sort the fvals and then simplex
@@ -279,12 +287,13 @@ function optimize_space!(state::NelderMeadState, obj, p0, lower_bounds, upper_bo
         if state.fcalls >= max_fcalls
             break
         end
-            
+
         # Break if f tolerance has been met no_improve_break times in a row
-        if (compute_df_rel(f1, fnp1) < ftol_rel) || (compute_df_abs(f1, fnp1) < ftol_abs)
-            n_converged += 1
-        else
+        #if (compute_df_rel(f1, fnp1) < ftol_rel) || (compute_df_abs(f1, fnp1) < ftol_abs)
+        if compute_df_rel(f1, fnp1) > ftol_rel
             n_converged = 0
+        else
+            n_converged += 1
         end
         if n_converged >= no_improve_break
             break
@@ -419,7 +428,9 @@ function compute_obj(obj, x, fmax, state::NelderMeadState, lower_bounds, upper_b
     if increase
         state.fcalls += 1
     end
+    state.ptest[state.subspace.indices] .= x
     f = obj(state.ptest)
+    #f = penalize(f, fmax, state.ptest, state.subspace, lower_bounds, upper_bounds, options)
     f = penalize(f, fmax, state.ptest, state.subspace, lower_bounds, upper_bounds, options)
     if !isfinite(f)
         f = 1E6 * fmax
@@ -444,8 +455,8 @@ function penalize(f, fmax, ptest, subspace, lower_bounds, upper_bounds, options)
 end
 
 
-function get_scale_factors(p0, lower_bounds, upper_bounds, vary; factor::Real=0.5)
-    scale_factors = zeros(length(p0))
+function get_scale_factors(p0, lower_bounds, upper_bounds, vary; factor::Real=0.15)
+    scale_factors = fill(NaN, length(p0))
     for i in eachindex(p0)
         if vary[i]
             has_lower = isfinite(lower_bounds[i])
@@ -473,6 +484,18 @@ end
 function get_result(state::NelderMeadState)
     return (;pbest=state.pbest, fbest=state.fbest, fcalls=state.fcalls, simplex=state.full_simplex, iterations=state.iteration)
 end
+
+#function param2bounded(x, lo, hi)
+
+#end
+
+# function param2unbounded(x, lo, hi)
+#     has_low = isfinite(lo)
+#     has_high = isfinite(hi)
+#     if has_low && has_high
+#         return 
+#     end
+# end
 
 
 end
