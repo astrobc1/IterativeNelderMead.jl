@@ -430,7 +430,6 @@ function compute_obj(obj, x, fmax, state::NelderMeadState, lower_bounds, upper_b
     end
     state.ptest[state.subspace.indices] .= x
     f = obj(state.ptest)
-    #f = penalize(f, fmax, state.ptest, state.subspace, lower_bounds, upper_bounds, options)
     f = penalize(f, fmax, state.ptest, state.subspace, lower_bounds, upper_bounds, options)
     if !isfinite(f)
         f = 1E6 * fmax
@@ -484,18 +483,6 @@ end
 function get_result(state::NelderMeadState)
     return (;pbest=state.pbest, fbest=state.fbest, fcalls=state.fcalls, simplex=state.full_simplex, iterations=state.iteration)
 end
-
-#function param2bounded(x, lo, hi)
-
-#end
-
-# function param2unbounded(x, lo, hi)
-#     has_low = isfinite(lo)
-#     has_high = isfinite(hi)
-#     if has_low && has_high
-#         return 
-#     end
-# end
 
 
 end
