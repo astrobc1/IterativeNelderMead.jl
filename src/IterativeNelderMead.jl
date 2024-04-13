@@ -1,10 +1,12 @@
 module IterativeNelderMead
 
+# Main.infiltrate(@__MODULE__, Base.@locals, @__FILE__, @__LINE__)
+
 using Statistics, LinearAlgebra
 
-export NelderMeadOptions, optimize, initial_simplex, initial_state
+export optimize
 
-struct NelderMeadOptions
+struct NMOptions
     max_fcalls::Int
     no_improve_break::Int
     n_iterations::Int
@@ -14,67 +16,68 @@ struct NelderMeadOptions
     xtol_abs::Float64
 end
 
-
-function NelderMeadOptions(n_vary::Int, ;max_fcalls::Int=150000 * n_vary, no_improve_break::Int=3, n_iterations::Int=n_vary, ftol_rel::Real=1E-8, ftol_abs::Real=1E-12, xtol_rel::Real=1E-8, xtol_abs::Real=1E-12)
-    @assert n_vary > 0
-    return NelderMeadOptions(max_fcalls, no_improve_break, n_iterations, ftol_rel, ftol_abs, xtol_rel, xtol_abs)
-end
-
-
 struct Subspace
-    index::Int
+    index::Union{Int, Nothing}
     indices::Vector{Int}
     indicesv::Vector{Int}
 end
 
+function NMOptions(n_vary::Int, ;max_fcalls::Int=50_000 * n_vary, no_improve_break::Int=3, n_iterations::Int=n_vary, ftol_rel::Real=1E-8, ftol_abs::Real=1E-12, xtol_rel::Real=1E-8, xtol_abs::Real=1E-12)
+    @assert n_vary > 0
+    return NMOptions(max_fcalls, no_improve_break, n_iterations, ftol_rel, ftol_abs, xtol_rel, xtol_abs)
+end
 
-mutable struct NelderMeadState
-    const full_space::Subspace
-    subspaces::Vector{Subspace}
-    subspace::Subspace
-    const full_simplex::Matrix{Float64}
-    const sub_simplex::Matrix{Float64}
-    ptest::Vector{Float64}
-    ftest::Float64
+mutable struct NMState
+    const p0::Vector{Float64}
+    const lb::Vector{Float64}
+    const ub::Vector{Float64}
+    const vary::Vector{Bool}
     const pbest::Vector{Float64}
+    const ptest::Vector{Float64}
+    const simplex′::Matrix{Float64}
     fprev::Float64
     fbest::Float64
     iteration::Int
     fcalls::Int
+    subspace::Subspace
 end
 
-function initial_state(obj, p0, lower_bounds, upper_bounds, vary, scale_factors)
-    full_space, subspaces = initialize_subspaces(vary)
-    full_simplex = initial_simplex(p0, lower_bounds, upper_bounds, vary, scale_factors)
-    sub_simplex = copy(full_simplex)
-    ptest = copy(p0)
-    ftest = obj(p0)
-    pbest = copy(p0)
-    fbest = ftest
-    return NelderMeadState(full_space, subspaces, full_space, full_simplex, sub_simplex, ptest, ftest, pbest, fbest, fbest, 1, 0)
+
+function initial_state(obj, p0, lb, ub, vary)
+    simplex′ = initial_simplex(p0, lb, ub, vary)
+    fbest = obj(p0)
+    @assert isfinite(fbest) "Objective $(obj) is not finite at initial value $(p0)"
+    inds = findall(vary)
+    indsv = collect(1:length(p0))
+    return NMState(p0, lb, ub, vary, copy(p0), copy(p0), simplex′, fbest, fbest, 1, 0, Subspace(nothing, inds, indsv))
 end
 
-function initial_simplex(p0, lower_bounds, upper_bounds, vary, scale_factors)
+
+function initial_simplex(p0, lb, ub, vary)
+    scale_factors = get_scale_factors(p0, lb, ub, vary, factor=0.15)
     indsv = findall(vary)
-    p0v = p0[indsv]
-    lower_boundsv = lower_bounds[indsv]
-    upper_boundsv = upper_bounds[indsv]
-    scale_factorsv = scale_factors[indsv]
-    nv = length(p0v)
+    nv = length(indsv)
+    p0v = @view p0[indsv]
+    lbv = @view lb[indsv]
+    ubv = @view ub[indsv]
+    scale_factorsv = @view scale_factors[indsv]
     simplex = repeat(p0v, 1, nv+1)
-    simplex[:, 1:end-1] .+= diagm(scale_factors[indsv])
+    simplex[:, 1:end-1] .+= diagm(scale_factorsv)
     for i=1:nv
-        clamp!(view(simplex, i, :), lower_boundsv[i], upper_boundsv[i])
+        clamp!(view(simplex, i, :), lbv[i], ubv[i])
     end
-    return simplex
+    simplex′ = copy(simplex)
+    for i=1:nv+1
+        simplex′[:, i] .= @views param2unbounded.(simplex[:, i], lbv, ubv)
+    end
+    return simplex′
 end
 
 
-function initialize_subspaces(vary)
+function get_subspaces(vary)
     subspaces = Subspace[]
     vi = findall(vary)
     nv = length(vi)
-    full_subspace = Subspace(0, vi, [1:nv;])
     if nv > 2
         for i=1:nv-1
             k1 = vi[i]
@@ -90,7 +93,7 @@ function initialize_subspaces(vary)
             push!(subspaces, Subspace(nv+1, [k1, k2], [2, nv-1]))
         end
     end
-    return full_subspace, subspaces
+    return subspaces
 end
 
 
@@ -98,8 +101,7 @@ function optimize(obj, p0::Vector{<:Real};
         lower_bounds::Union{Vector{<:Real}, Nothing}=nothing,
         upper_bounds::Union{Vector{<:Real}, Nothing}=nothing,
         vary::Union{Vector{Bool}, Nothing}=nothing,
-        scale_factors::Union{Vector{<:Real}, Nothing}=nothing,
-        options::Union{NamedTuple, NelderMeadOptions, Nothing}=nothing
+        options::Union{NamedTuple, NMOptions, Nothing}=nothing
     )
 
     ########################
@@ -120,11 +122,9 @@ function optimize(obj, p0::Vector{<:Real};
     # Varied params
     if isnothing(vary)
         vary = trues(n)
-        bad = findall(lower_bounds .== upper_bounds)
-        vary[bad] .= false
+    else
+        vary = copy(vary)
     end
-    nv = sum(vary)
-    @assert nv > 0 "No parameters found to optimize."
 
     # Sanity check bounds and vary
     for i in eachindex(vary)
@@ -133,71 +133,74 @@ function optimize(obj, p0::Vector{<:Real};
         end
     end
 
-    # Scale factors
-    if isnothing(scale_factors)
-        scale_factors = get_scale_factors(p0, lower_bounds, upper_bounds, vary)
-    end
+    # How many parameters to optimize
+    indsv = findall(vary)
+    nv = length(indsv)
+    @assert nv > 0 "No parameters found to optimize."
 
     # Options
     if isnothing(options)
-        options = NelderMeadOptions(sum(vary))
+        options = NMOptions(sum(vary))
     elseif options isa NamedTuple
-        options = NelderMeadOptions(sum(vary); options...)
+        options = NMOptions(sum(vary); options...)
     else
-        @assert options isa NelderMeadOptions
+        @assert options isa NMOptions
     end
 
     # Initial state
-    state = initial_state(obj, p0, lower_bounds, upper_bounds, vary, scale_factors)
+    state = initial_state(obj, p0, lower_bounds, upper_bounds, vary)
+    full_space = state.subspace
+
+    # Get remainins subspaces
+    subspaces = get_subspaces(vary)
+
+    #Main.infiltrate(@__MODULE__, Base.@locals, @__FILE__, @__LINE__)
 
     # Loop over iterations
     for i=1:options.n_iterations
 
-        #Main.infiltrate(@__MODULE__, Base.@locals, @__FILE__, @__LINE__)
-
         # Perform Ameoba call for all parameters
-        state.subspace = state.full_space
-        state.fprev = state.fbest
-        optimize_space!(state, obj, p0, lower_bounds, upper_bounds, vary, options)
+        optimize!(obj, state, options)
         
         # If there's <= 2 params, a three-simplex is the smallest simplex used and only used once.
         if nv <= 2
             break
         end
 
-        # Converged?
+        # Check fcalls
         if state.fcalls >= options.max_fcalls
             break
         end
         
         # Perform Ameoba call for subspaces
-        for subspace ∈ state.subspaces
+        for subspace ∈ subspaces
             state.subspace = subspace
-            optimize_space!(state, obj, p0, lower_bounds, upper_bounds, vary, options)
+            optimize!(obj, state, options)
         end
 
         # Check x
-        dx_abs_converged = compute_dx_abs(state.full_simplex) < options.xtol_abs
-        dx_rel_converged = compute_dx_rel(state.full_simplex) < options.xtol_rel
+        dx_abs_converged = compute_dx_abs(state) < options.xtol_abs
+        dx_rel_converged = compute_dx_rel(state) < options.xtol_rel
 
         # Check f
-        df_abs_converged = compute_df_abs(state.fbest, state.fprev) < options.ftol_abs
-        df_rel_converged = compute_df_rel(state.fbest, state.fprev) < options.ftol_rel
+        df_abs_converged = compute_df_abs(state) < options.ftol_abs
+        df_rel_converged = compute_df_rel(state) < options.ftol_rel
 
         # Check f calls
         fcalls_converged = state.fcalls >= options.max_fcalls
 
         # Converged?
         if dx_abs_converged || dx_rel_converged || df_abs_converged || df_rel_converged || fcalls_converged
-            # @show compute_df_abs(state.fbest, state.fprev)
-            # @show compute_df_rel(state.fbest, state.fprev)
-            # @show compute_dx_rel(state.full_simplex)
-            # @show compute_dx_abs(state.full_simplex)
+            # @show compute_df_abs(state)
+            # @show compute_df_rel(state)
+            # @show compute_dx_rel(state)
+            # @show compute_dx_abs(state)
             # @show state.fcalls
             # @show dx_abs_converged dx_rel_converged df_abs_converged df_rel_converged fcalls_converged
             break
-        else
-            state.iteration = i
+        elseif i < options.n_iterations
+            state.subspace = full_space
+            state.iteration = i + 1
         end
 
     end
@@ -211,37 +214,40 @@ function optimize(obj, p0::Vector{<:Real};
 end
 
 
-function get_subspace_simplex(subspace, p0, pbest)
-    n = length(subspace.indices)
-    simplex = zeros(n, n+1)
-    simplex[:, 1] .= p0[subspace.indices]
-    simplex[:, 2] .= pbest[subspace.indices]
-    for i=3:n+1
-        simplex[:, i] .= pbest[subspace.indices]
-        j = i - 2
-        simplex[j, i] = p0[j]
+function get_subspace_simplex(state::NMState)
+    if !isnothing(state.subspace.index)
+        inds = state.subspace.indices
+        indsv = state.subspace.indicesv
+        n = length(inds)
+        S′ = zeros(n, n+1)
+        S′[:, 1] .= @views param2unbounded.(state.p0[inds], state.lb[inds], state.ub[inds])
+        v2 = param2unbounded.(state.pbest[inds], state.lb[inds], state.ub[inds])
+        S′[:, 2] .= v2
+        for i=3:n+1
+            S′[:, i] .= v2
+            j = i - 2
+            S′[j, i] = param2unbounded(state.p0[inds[j]], state.lb[inds[j]], state.ub[inds[j]])
+        end
+    else
+        S′ = copy(state.simplex′)
     end
-    return simplex
+    return S′
 end
 
 
-function optimize_space!(state::NelderMeadState, obj, p0, lower_bounds, upper_bounds, vary, options::NelderMeadOptions)
+function optimize!(obj, state::NMState, options::NMOptions)
 
     # Simplex for this subspace
-    if state.subspace.index < 1
-        simplex = copy(state.full_simplex)
-    else
-        simplex = get_subspace_simplex(state.subspace, p0, state.pbest)
-    end
-    nx, nxp1 = size(simplex)
+    S′ = get_subspace_simplex(state)
+    nx, nxp1 = size(S′)
 
-    # Max f evals
+    # Alias options
     max_fcalls = options.max_fcalls
     ftol_rel = options.ftol_rel
     ftol_abs = options.ftol_abs
-
-    # Keeps track of the number of times the solver thinks it has converged in a row.
     no_improve_break = options.no_improve_break
+
+    # Number of times converged in a row
     n_converged = 0
 
     # Initiate storage arrays
@@ -253,17 +259,18 @@ function optimize_space!(state::NelderMeadState, obj, p0, lower_bounds, upper_bo
     xcc = zeros(nx)
     
     # Generate the fvals for the initial simplex
+    penalty = 1000 * abs(state.fbest)
     for i=1:nxp1
-        fvals[i] = @views compute_obj(obj, simplex[:, i], 1000 * abs(state.fbest), state, lower_bounds, upper_bounds, vary, options)
+        fvals[i] = @views compute_obj(obj, S′[:, i], state, penalty, options)
     end
 
     # Sort the fvals and then simplex
     inds = sortperm(fvals)
-    simplex .= simplex[:, inds]
+    S′ .= S′[:, inds]
     fvals .= fvals[inds]
-    x1 = simplex[:, 1]
-    xn = simplex[:, end-1]
-    xnp1 = simplex[:, end]
+    x1 = S′[:, 1]
+    xn = S′[:, end-1]
+    xnp1 = S′[:, end]
     f1 = fvals[1]
     fn = fvals[end-1]
     fnp1 = fvals[end]
@@ -289,11 +296,12 @@ function optimize_space!(state::NelderMeadState, obj, p0, lower_bounds, upper_bo
         end
 
         # Break if f tolerance has been met no_improve_break times in a row
-        #if (compute_df_rel(f1, fnp1) < ftol_rel) || (compute_df_abs(f1, fnp1) < ftol_abs)
-        if compute_df_rel(f1, fnp1) > ftol_rel
-            n_converged = 0
-        else
+        #@show compute_df_abs(f1, fnp1)
+        #@show compute_df_rel(f1, fnp1)
+        if (compute_df_rel(f1, fnp1) < ftol_rel) || (compute_df_abs(f1, fnp1) < ftol_abs)
             n_converged += 1
+        else
+            n_converged = 0
         end
         if n_converged >= no_improve_break
             break
@@ -304,42 +312,42 @@ function optimize_space!(state::NelderMeadState, obj, p0, lower_bounds, upper_bo
         
         # The "average" vector, ignoring the worst point
         # We first anchor points off this average Vector
-        xbar .= @views vec(mean(simplex[:, 1:end-1], dims=2))
+        xbar .= @views vec(mean(S′[:, 1:end-1], dims=2))
         
         # The reflection point
         xr .= xbar .+ α .* (xbar .- xnp1)
         
         # Update the current testing parameter with xr
-        fr = compute_obj(obj, xr, fmax, state, lower_bounds, upper_bounds, vary, options)
+        fr = compute_obj(obj, xr, state, fmax, options)
 
         if fr < f1
             xe .= xbar .+ γ .* (xbar .- xnp1)
-            fe = compute_obj(obj, xe, fmax, state, lower_bounds, upper_bounds, vary, options)
+            fe = compute_obj(obj, xe, state, fmax, options)
             if fe < fr
-                simplex[:, end] .= xe
+                S′[:, end] .= xe
                 fvals[end] = fe
             else
-                simplex[:, end] .= xr
+                S′[:, end] .= xr
                 fvals[end] = fr
             end
         elseif fr < fn
-            simplex[:, end] .= xr
+            S′[:, end] .= xr
             fvals[end] = fr
         else
             if fr < fnp1
                 xc .= xbar .+ σ .* (xbar .- xnp1)
-                fc = compute_obj(obj, xc, fmax, state, lower_bounds, upper_bounds, vary, options)
+                fc = compute_obj(obj, xc, state, fmax, options)
                 if fc <= fr
-                    simplex[:, end] .= xc
+                    S′[:, end] .= xc
                     fvals[end] = fc
                 else
                     shrink = true
                 end
             else
                 xcc .= xbar .+ σ .* (xnp1 .- xbar)
-                fcc = compute_obj(obj, xcc, fmax, state, lower_bounds, upper_bounds, vary, options)
+                fcc = compute_obj(obj, xcc, state, fmax, options)
                 if fcc < fvals[end]
-                    simplex[:, end] .= xcc
+                    S′[:, end] .= xcc
                     fvals[end] = fcc
                 else
                     shrink = true
@@ -348,18 +356,18 @@ function optimize_space!(state::NelderMeadState, obj, p0, lower_bounds, upper_bo
         end
         if shrink
             for j=2:nxp1
-                simplex[:, j] .= @views x1 .+ δ .* (simplex[:, j] .- x1)
-                fvals[j] = @views compute_obj(obj, simplex[:, j], fmax, state, lower_bounds, upper_bounds, vary, options)
+                S′[:, j] .= @views x1 .+ δ .* (S′[:, j] .- x1)
+                fvals[j] = @views compute_obj(obj, S′[:, j], state, fmax, options)
             end
         end
 
         # Sort
         inds = sortperm(fvals)
         fvals .= fvals[inds]
-        simplex .= simplex[:, inds]
-        x1 .= simplex[:, 1]
-        xn .= simplex[:, end-1]
-        xnp1 .= simplex[:, end]
+        S′ .= S′[:, inds]
+        x1 .= S′[:, 1]
+        xn .= S′[:, end-1]
+        xnp1 .= S′[:, end]
         f1 = fvals[1]
         fn = fvals[end-1]
         fnp1 = fvals[end]
@@ -369,22 +377,26 @@ function optimize_space!(state::NelderMeadState, obj, p0, lower_bounds, upper_bo
     # Sort
     inds = sortperm(fvals)
     fvals .= fvals[inds]
-    simplex .= simplex[:, inds]
-    x1 .= simplex[:, 1]
-    xn .= simplex[:, end-1]
-    xnp1 .= simplex[:, end]
+    S′ .= S′[:, inds]
+    x1 .= S′[:, 1]
+    xn .= S′[:, end-1]
+    xnp1 .= S′[:, end]
     f1 = fvals[1]
     fn = fvals[end-1]
     fnp1 = fvals[end]
     
     # Update the full simplex and best fit parameters
-    state.pbest[state.subspace.indices] .= x1
+    inds = state.subspace.indices
+    indsv = state.subspace.indicesv
+    state.pbest[inds] .= @views param2bounded.(x1, state.lb[inds], state.ub[inds])
+    state.ptest .= copy(state.pbest)
+    state.fprev = state.fbest
     state.fbest = f1
-    vi = findall(vary)
-    if state.subspace.index < 1
-        state.full_simplex .= copy(simplex)
+    if !isnothing(state.subspace.index)
+        _inds = findall(state.vary)
+        state.simplex′[:, state.subspace.index] .= @views param2unbounded.(state.pbest[_inds], state.lb[_inds], state.ub[_inds])
     else
-        state.full_simplex[:, state.subspace.index] .= state.pbest[vi]
+        state.simplex′ .= copy(S′)
     end
 
 end
@@ -393,67 +405,64 @@ end
 ###################
 #### TOLERANCE ####
 ###################
-    
-function compute_dx_rel(simplex::AbstractMatrix{Float64})
+
+compute_dx_rel(state::NMState) = compute_dx_rel(simplex2bounded(state))
+function compute_dx_rel(simplex::Matrix{<:Real})
     a = minimum(simplex, dims=2)
     b = maximum(simplex, dims=2)
     c = (abs.(b) .+ abs.(a)) ./ 2
-    bad = findall(c .< 0)
-    c[bad] .= 1
+    clamp!(c, 0, Inf)
     r = abs.(b .- a) ./ c
     return maximum(r)
 end
 
-function compute_dx_abs(simplex::AbstractMatrix{Float64})
+compute_dx_abs(state::NMState) = compute_dx_abs(simplex2bounded(state))
+function compute_dx_abs(simplex::Matrix{<:Real})
     a = minimum(simplex, dims=2)
     b = maximum(simplex, dims=2)
     r = abs.(b .- a)
     return maximum(r)
 end
 
-function compute_df_rel(a, b)
+function simplex2bounded(state::NMState)
+    S = similar(state.simplex′)
+    indsv = findall(state.vary)
+    for i in axes(S, 2)
+        S[:, i] .= @views param2bounded.(state.simplex′[:, i], state.lb[indsv], state.ub[indsv])
+    end
+    return S
+end
+
+compute_df_rel(state::NMState) = compute_df_rel(state.fbest, state.fprev)
+
+function compute_df_rel(a::Real, b::Real)
     avg = (abs(a) + abs(b)) / 2
     return abs(a - b) / avg
 end
 
-function compute_df_abs(a, b)
-    return abs(a - b)
-end
+compute_df_abs(state::NMState) = compute_df_abs(state.fbest, state.fprev)
+compute_df_abs(a::Real, b::Real) = abs(a - b)
 
-###################
-#### OBJECTIVE ####
-###################
 
-function compute_obj(obj, x, fmax, state::NelderMeadState, lower_bounds, upper_bounds, vary, options::NelderMeadOptions; increase::Bool=true)
+# Computing the objective
+function compute_obj(obj, x′, state::NMState, fmax::Real, options::NMOptions; increase::Bool=true)
     if increase
         state.fcalls += 1
     end
-    state.ptest[state.subspace.indices] .= x
+    inds = state.subspace.indices
+    state.ptest[inds] .= param2bounded.(x′, state.lb[inds], state.ub[inds])
     f = obj(state.ptest)
-    f = penalize(f, fmax, state.ptest, state.subspace, lower_bounds, upper_bounds, options)
     if !isfinite(f)
         f = 1E6 * fmax
-    end
-    return f
-end
-
-function penalize(f, fmax, ptest, subspace, lower_bounds, upper_bounds, options)
-    penalty_factor = 100 * fmax
-    for i in eachindex(subspace.indices)
-        j = subspace.indices[i]
-        if ptest[j] < lower_bounds[j]
-            f += penalty_factor
-            f += penalty_factor * (lower_bounds[j] - ptest[j])
-        end
-        if ptest[j] > upper_bounds[j]
-            f += penalty_factor
-            f += penalty_factor * (ptest[j] - upper_bounds[j])
+        if !isfinite(f)
+            f = 1E6
         end
     end
     return f
 end
 
 
+# Scale factors for initial simplex
 function get_scale_factors(p0, lower_bounds, upper_bounds, vary; factor::Real=0.15)
     scale_factors = fill(NaN, length(p0))
     for i in eachindex(p0)
@@ -475,13 +484,46 @@ function get_scale_factors(p0, lower_bounds, upper_bounds, vary; factor::Real=0.
 end
 
 
-################
-#### OUTPUT ####
-################
+# Bounding parameters
+function param2bounded(x, lo, hi, vary=true)
+    if ~vary
+        return x
+    end
+    has_lo = isfinite(lo)
+    has_hi = isfinite(hi)
+    if has_lo && has_hi
+        return lo + (sin(x) + 1) * ((hi - lo) / 2)
+    elseif has_lo
+        return lo - 1 + sqrt(x^2 + 1)
+    elseif has_hi
+        return hi + 1 - sqrt(x^2 + 1)
+    else
+        return x
+    end
+end
 
 
-function get_result(state::NelderMeadState)
-    return (;pbest=state.pbest, fbest=state.fbest, fcalls=state.fcalls, simplex=state.full_simplex, iterations=state.iteration)
+function param2unbounded(x, lo, hi, vary=true)
+    if ~vary
+        return x
+    end
+    has_lo = isfinite(lo)
+    has_hi = isfinite(hi)
+    if has_lo && has_hi
+        return asin(2 * (x - lo) / (hi - lo) - 1)
+    elseif has_lo
+        return sqrt((x - lo + 1)^2 - 1)
+    elseif has_hi
+        return sqrt((hi - x + 1)^2 - 1)
+    else
+        return x
+    end
+end
+
+# Output
+function get_result(state::NMState)
+    simplex = simplex2bounded(state)
+    return (;state.pbest, state.fbest, state.fcalls, simplex, iterations=state.iteration, p0=state.p0, state)
 end
 
 
